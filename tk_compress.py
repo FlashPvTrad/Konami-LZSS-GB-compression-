@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-tk_compress.py - compresse un fichier au format LZSS de Konami GB Collection Vol.2 (Track'n Field et autres).
+tk_compress.py - compresse un fichier au format LZSS de Konami pour Game Boy (trois variantes : A, B, C).
 
-Le flux produit est lu par les decodeurs du jeu (verifie sur le code reel de la ROM, variantes A et B).
-  Variante A (defaut) : fenetre ecrite a partir de 0x3EE, matchs de 3 a 18   (moteur $25xx)
-  Variante B          : fenetre ecrite a partir de 0x3F0, matchs de 3 a 16   (moteur $3A5E / $3A65)
+Les flux produits sont lus par les decodeurs des jeux (verifie sur le code reel des ROM, voir tk_sm83_check.py).
+
+  Variante  Jeu                       Depart   Match   hi = octet 2 : position haute / longueur-3
+  A         Track & Field             $3EE     3..18   bits 4-7 / bits 0-3
+  B         Parodius                  $3F0     3..16   bits 4-7 / bits 0-3
+  C         Castlevania Legends       $3DE     3..34   bits 5-6 / bits 0-4      (bit 7 = 0)
 
 Modes :
-  optimal  (defaut) : plus petit flux possible (parsing optimal par programmation dynamique)
-  okumura           : encodeur de reference d'Okumura (glouton + arbre binaire). Donne la meme taille
-                      que les flux d'origine du jeu (identiques a l'octet pres dans la majorite des cas)
+  optimal  (defaut) : plus petit flux possible. Parsing optimal EXACT en octets (donnees + octets de flags)
+                      par programmation dynamique.
+  okumura           : encodeur de reference d'Okumura (glouton + arbre binaire). Donne la meme taille que
+                      les flux d'origine des jeux (identiques a l'octet pres dans une partie des cas).
 
 Le programme relit et decompresse le resultat pour s'assurer qu'il redonne exactement l'entree.
 --max-size refuse un flux plus gros que la place disponible (utile pour reinjecter en place dans la ROM).
@@ -19,23 +23,29 @@ c'est la longueur que le jeu doit recevoir.
 Exemples :
   tk_compress.py tuiles.bin tuiles.lz
   tk_compress.py map.bin map.lz --variant B --mode okumura
-  tk_compress.py tuiles.bin tuiles.lz --max-size 640
+  tk_compress.py tuiles.bin tuiles.lz --variant C --max-size 1449
 """
 import argparse, sys
 
 N = 1024          # taille de la fenetre
-F = 18            # valeur par defaut (variante A)
 THRESHOLD = 2     # longueur min d'un match = 3
-START = N - F
-VARIANT_F = {"A": 18, "B": 16}
+# variante : (F, decalage de la position haute, masque de la position haute, masque de la longueur)
+# F = longueur de match max ; position d'ecriture initiale = N - F
+VARIANTS = {"A": (18, 4, 0x0F, 0x0F), "B": (16, 4, 0x0F, 0x0F), "C": (34, 5, 0x03, 0x1F)}
 
 
-def _find_matches(data, F=F):
+def _token(variant, pos, length):
+    """Les 2 octets d'un match : (lo, hi)."""
+    _, ps, pm, _ = VARIANTS[variant]
+    return pos & 0xFF, (((pos >> 8) & pm) << ps) | (length - THRESHOLD - 1)
+
+
+def _find_matches(data, F):
     """Pour chaque i : (longueur_max, distance) du meilleur match (longueur >= 3), sinon (0, 0).
 
     La position d'un octet dans la fenetre ne depend que de son rang dans la sortie
-    ((0x3EE + i) mod 1024), donc les candidats ne dependent pas du parsing choisi.
-    Historique virtuel H : 18 inconnus (jamais utilises), 1006 x $20, puis les donnees."""
+    ((N - F + i) mod 1024), donc les candidats ne dependent pas du parsing choisi.
+    Historique virtuel H : F inconnus (jamais utilises), N-F x $20, puis les donnees."""
     START = N - F
     n = len(data)
     H = [-1] * F + [0x20] * START + list(data)
@@ -68,198 +78,192 @@ def _find_matches(data, F=F):
     return best
 
 
-def compress_optimal(data, F=F):
-    """Compresse `data`. Parsing optimal (programmation dynamique, cout en bits :
-    litteral = 9 bits, match = 17 bits). Le flux produit est lu par le decodeur du jeu."""
+def compress_optimal(data, variant="A"):
+    """Parsing optimal exact : cout = octets de donnees + 1 octet de flags par groupe de 8 elements.
+    Etat de la programmation dynamique : (position, rang de l'element dans son groupe de 8)."""
+    F = VARIANTS[variant][0]
+    START = N - F
     data = bytes(data)
     n = len(data)
     if n == 0:
         return b""
-    START = N - F
     best = _find_matches(data, F)
     INF = 1 << 60
-    cost = [INF] * (n + 1)
-    choice = [0] * n                           # 0 = litteral, sinon longueur du match
-    cost[n] = 0
+    f = [[INF] * 8 for _ in range(n + 1)]
+    ch = [[0] * 8 for _ in range(n + 1)]
+    for k in range(8):
+        f[n][k] = 0
     for i in range(n - 1, -1, -1):
-        c, ch = 9 + cost[i + 1], 0
-        L, _ = best[i]
-        for l in range(THRESHOLD + 1, L + 1):
-            cc = 17 + cost[i + l]
-            if cc < c:
-                c, ch = cc, l
-        cost[i], choice[i] = c, ch
+        L = best[i][0]
+        for k in range(8):
+            fl = 1 if k == 0 else 0
+            nk = (k + 1) & 7
+            c, c0 = 1 + fl + f[i + 1][nk], 0                  # litteral : 1 octet
+            for l in range(THRESHOLD + 1, L + 1):             # match : 2 octets
+                cc = 2 + fl + f[i + l][nk]
+                if cc < c:
+                    c, c0 = cc, l
+            f[i][k], ch[i][k] = c, c0
     out = bytearray()
-    i = 0
-    flagpos = -1
-    nbits = 0
+    i = k = 0
+    fp = -1
     while i < n:
-        if nbits == 0:
-            flagpos = len(out); out.append(0); nbits = 8
-        bit_index = 8 - nbits
-        nbits -= 1
-        l = choice[i]
+        if k == 0:
+            fp = len(out); out.append(0)
+        l = ch[i][k]
         if l == 0:
-            out[flagpos] |= 1 << bit_index
+            out[fp] |= 1 << k
             out.append(data[i]); i += 1
         else:
-            d = best[i][1]
-            pos = (START + i - d) & (N - 1)
-            out.append(pos & 0xFF)
-            out.append(((pos >> 8) << 4) | (l - THRESHOLD - 1))
-            i += l
+            pos = (START + i - best[i][1]) & (N - 1)
+            lo, hi = _token(variant, pos, l)
+            out.append(lo); out.append(hi); i += l
+        k = (k + 1) & 7
     return bytes(out)
 
 
-def compress_okumura(data, F=F):
-    """Port fidele de LZSS.C (H. Okumura, 1989) avec N=1024 : arbre binaire de recherche,
-    parsing glouton, distance max N-F = 1006. Les flux obtenus ont exactement la taille
-    de ceux du jeu (identiques a l'octet pres dans 17 cas sur 25 ; sinon seul le choix entre
-    deux matchs de meme longueur differe)."""
-    NIL=N
-    text_buf=bytearray(N+F-1)
-    lson=[NIL]*(N+1); rson=[NIL]*(N+257); dad=[NIL]*(N+1)
-    st={'mp':0,'ml':0}
+def compress_okumura(data, variant="A"):
+    """Port fidele de LZSS.C (H. Okumura, 1989) avec N=1024 et F selon la variante : arbre binaire
+    de recherche, parsing glouton, distance max N-F. Seul le codage du token depend de la variante."""
+    F = VARIANTS[variant][0]
+    NIL = N
+    text_buf = bytearray(N + F - 1)
+    lson = [NIL] * (N + 1); rson = [NIL] * (N + 257); dad = [NIL] * (N + 1)
+    st = {"mp": 0, "ml": 0}
+
     def insert(r):
-        cmp=1; key=r; p=N+1+text_buf[key]
-        rson[r]=lson[r]=NIL; st['ml']=0
+        cmp = 1; key = r; p = N + 1 + text_buf[key]
+        rson[r] = lson[r] = NIL; st["ml"] = 0
         while True:
-            if cmp>=0:
-                if rson[p]!=NIL: p=rson[p]
-                else: rson[p]=r; dad[r]=p; return
+            if cmp >= 0:
+                if rson[p] != NIL: p = rson[p]
+                else: rson[p] = r; dad[r] = p; return
             else:
-                if lson[p]!=NIL: p=lson[p]
-                else: lson[p]=r; dad[r]=p; return
-            i=1
-            while i<F:
-                cmp=text_buf[key+i]-text_buf[p+i]
-                if cmp!=0: break
-                i+=1
-            if i>st['ml']:
-                st['mp']=p; st['ml']=i
-                if i>=F: break
-        dad[r]=dad[p]; lson[r]=lson[p]; rson[r]=rson[p]
-        dad[lson[p]]=r; dad[rson[p]]=r
-        if rson[dad[p]]==p: rson[dad[p]]=r
-        else: lson[dad[p]]=r
-        dad[p]=NIL
+                if lson[p] != NIL: p = lson[p]
+                else: lson[p] = r; dad[r] = p; return
+            i = 1
+            while i < F:
+                cmp = text_buf[key + i] - text_buf[p + i]
+                if cmp != 0: break
+                i += 1
+            if i > st["ml"]:
+                st["mp"] = p; st["ml"] = i
+                if i >= F: break
+        dad[r] = dad[p]; lson[r] = lson[p]; rson[r] = rson[p]
+        dad[lson[p]] = r; dad[rson[p]] = r
+        if rson[dad[p]] == p: rson[dad[p]] = r
+        else: lson[dad[p]] = r
+        dad[p] = NIL
+
     def delete(p):
-        if dad[p]==NIL: return
-        if rson[p]==NIL: q=lson[p]
-        elif lson[p]==NIL: q=rson[p]
+        if dad[p] == NIL: return
+        if rson[p] == NIL: q = lson[p]
+        elif lson[p] == NIL: q = rson[p]
         else:
-            q=lson[p]
-            if rson[q]!=NIL:
+            q = lson[p]
+            if rson[q] != NIL:
                 while True:
-                    q=rson[q]
-                    if rson[q]==NIL: break
-                rson[dad[q]]=lson[q]; dad[lson[q]]=dad[q]
-                lson[q]=lson[p]; dad[lson[p]]=q
-            rson[q]=rson[p]; dad[rson[p]]=q
-        dad[q]=dad[p]
-        if rson[dad[p]]==p: rson[dad[p]]=q
-        else: lson[dad[p]]=q
-        dad[p]=NIL
-    data=bytes(data); n=len(data)
-    if n==0: return b""
-    out=bytearray(); code=[0]; mask=1
-    s=0; r=N-F
-    for i in range(s,r): text_buf[i]=0x20
-    ip=0; ln=0
-    while ln<F and ip<n:
-        text_buf[r+ln]=data[ip]; ip+=1; ln+=1
-    for i in range(1,F+1): insert(r-i)
+                    q = rson[q]
+                    if rson[q] == NIL: break
+                rson[dad[q]] = lson[q]; dad[lson[q]] = dad[q]
+                lson[q] = lson[p]; dad[lson[p]] = q
+            rson[q] = rson[p]; dad[rson[p]] = q
+        dad[q] = dad[p]
+        if rson[dad[p]] == p: rson[dad[p]] = q
+        else: lson[dad[p]] = q
+        dad[p] = NIL
+
+    data = bytes(data); n = len(data)
+    if n == 0:
+        return b""
+    out = bytearray(); code = [0]; mask = 1
+    s = 0; r = N - F
+    for i in range(s, r): text_buf[i] = 0x20
+    ip = 0; ln = 0
+    while ln < F and ip < n:
+        text_buf[r + ln] = data[ip]; ip += 1; ln += 1
+    for i in range(1, F + 1): insert(r - i)
     insert(r)
     while True:
-        if st['ml']>ln: st['ml']=ln
-        if st['ml']<=THRESHOLD:
-            st['ml']=1; code[0]|=mask; code.append(text_buf[r])
+        if st["ml"] > ln: st["ml"] = ln
+        if st["ml"] <= THRESHOLD:
+            st["ml"] = 1; code[0] |= mask; code.append(text_buf[r])
         else:
-            mp=st['mp']
-            code.append(mp&255); code.append(((mp>>4)&0xF0)|(st['ml']-(THRESHOLD+1)))
-        mask<<=1
-        if mask==256:
-            out+=bytes(code); code=[0]; mask=1
-        last=st['ml']
-        i=0
-        while i<last and ip<n:
-            c=data[ip]; ip+=1
-            delete(s); text_buf[s]=c
-            if s<F-1: text_buf[s+N]=c
-            s=(s+1)&(N-1); r=(r+1)&(N-1)
-            insert(r); i+=1
-        while i<last:
-            i+=1
-            delete(s); s=(s+1)&(N-1); r=(r+1)&(N-1)
-            ln-=1
+            lo, hi = _token(variant, st["mp"], st["ml"])
+            code.append(lo); code.append(hi)
+        mask <<= 1
+        if mask == 256:
+            out += bytes(code); code = [0]; mask = 1
+        last = st["ml"]; i = 0
+        while i < last and ip < n:
+            c = data[ip]; ip += 1
+            delete(s); text_buf[s] = c
+            if s < F - 1: text_buf[s + N] = c
+            s = (s + 1) & (N - 1); r = (r + 1) & (N - 1)
+            insert(r); i += 1
+        while i < last:
+            i += 1
+            delete(s); s = (s + 1) & (N - 1); r = (r + 1) & (N - 1)
+            ln -= 1
             if ln: insert(r)
-        if ln<=0: break
-    if len(code)>1: out+=bytes(code)
+        if ln <= 0: break
+    if len(code) > 1: out += bytes(code)
     return bytes(out)
 
 
-def compress(data, mode="optimal", F=18):
+def compress(data, mode="optimal", variant="A"):
     if mode == "optimal":
-        return compress_optimal(data, F)
+        return compress_optimal(data, variant)
     if mode == "okumura":
-        return compress_okumura(data, F)
+        return compress_okumura(data, variant)
     raise ValueError("mode inconnu : %r" % mode)
 
 
-# decodeur, uniquement pour verifier le resultat
-def decompress_limited(src, outlen, start=0, limit=None, F=F):
-    """Decodeur tolerant. Produit au plus `outlen` octets en ne lisant pas plus de `limit`
-    octets de source (None = tout). S'arrete proprement si le flux est epuise ou si un
-    token pointe hors de la fenetre de 1 Ko (le vrai decodeur lirait alors la WRAM).
-    Retourne (donnees, octets_source_consommes, complet)."""
+def decompress_limited(src, outlen, variant="A"):
+    """Decodeur, uniquement pour verifier le resultat. Retourne (donnees, octets_consommes, complet)."""
+    F, ps, pm, lm = VARIANTS[variant]
     START = N - F
-    end = len(src) if limit is None else min(len(src), start + limit)
     buf = bytearray([0x20]) * START + bytearray(F)
-    r = START
-    out = bytearray()
-    p = start
-    flags = 0
-    nbits = 0
+    r = START; out = bytearray(); p = 0; flags = 0; nbits = 0
     while len(out) < outlen:
         q = p
         if nbits == 0:
-            if q >= end: break
+            if q >= len(src): break
             fl = src[q]; q += 1; nb = 8
         else:
             fl, nb = flags, nbits
-        bit = fl & 1
-        if bit:
-            if q >= end: break
+        if fl & 1:
+            if q >= len(src): break
             c = src[q]; q += 1
             out.append(c); buf[r] = c; r = (r + 1) & (N - 1)
         else:
-            if q + 1 >= end: break
+            if q + 1 >= len(src): break
             lo, hi = src[q], src[q + 1]; q += 2
-            pos = lo | ((hi >> 4) << 8)
+            pos = lo | (((hi >> ps) & pm) << 8)
             if pos >= N: break
-            for _ in range((hi & 0x0F) + THRESHOLD + 1):
+            for _ in range((hi & lm) + THRESHOLD + 1):
                 if len(out) >= outlen: break
                 c = buf[pos]; pos = (pos + 1) & (N - 1)
                 out.append(c); buf[r] = c; r = (r + 1) & (N - 1)
         flags, nbits, p = fl >> 1, nb - 1, q
-    return bytes(out), p - start, len(out) >= outlen
+    return bytes(out), p, len(out) >= outlen
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Compresse un fichier en LZSS Konami (variantes A et B).")
+    ap = argparse.ArgumentParser(description="Compresse un fichier en LZSS Konami (variantes A, B et C).")
     ap.add_argument("entree", help="fichier a compresser")
     ap.add_argument("sortie", help="fichier compresse")
-    ap.add_argument("--variant", "-v", choices=("A", "B"), default="A", help="variante du codec (defaut A)")
+    ap.add_argument("--variant", "-v", choices=sorted(VARIANTS), default="A",
+                    help="variante du codec : A Track & Field (defaut), B Parodius, C Castlevania Legends")
     ap.add_argument("--mode", "-m", choices=("optimal", "okumura"), default="optimal")
     ap.add_argument("--max-size", type=lambda x: int(x, 0), help="echoue si le flux depasse cette taille (octets)")
     ap.add_argument("--no-verify", action="store_true", help="ne pas relire/decompresser le resultat")
     a = ap.parse_args()
-    Fv = VARIANT_F[a.variant]
 
     data = open(a.entree, "rb").read()
-    z = compress(data, a.mode, Fv)
+    z = compress(data, a.mode, a.variant)
     if data and not a.no_verify:
-        back, used, ok = decompress_limited(z, len(data), 0, None, Fv)
+        back, used, ok = decompress_limited(z, len(data), a.variant)
         if not ok or back != data or used != len(z):
             sys.exit("erreur interne : l'aller-retour ne redonne pas l'entree")
     if a.max_size is not None and len(z) > a.max_size:

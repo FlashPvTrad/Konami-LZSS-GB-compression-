@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-tk_sm83_check.py - verifie tk_lzss contre le VRAI code du jeu.
+tk_sm83_check.py - verifie les outils (tk_compress.py / tk_decompress.py) contre le VRAI code des jeux.
 
 Un mini-emulateur Game Boy (jeu d'instructions SM83, sans timing, sans I/O) execute la routine
-de decompression de la ROM ($25C3/$25CA -> $25CE... $267C, bank 0) sur des flux compresses, puis
-compare ce que le jeu ecrit en memoire avec les donnees attendues.
+de decompression de la ROM sur des flux compresses, puis compare ce que le jeu ecrit en memoire
+avec les donnees attendues :
+  variante A (Track & Field)        $25C3/$25CA -> $25CE... $267C, bank 0
+  variante B (Parodius)             $3A65, bank 0
+  variante C (Castlevania Legends)  $2ECD, bank 0 (seule la routine de remplissage en RAM $DEC9 est simulee)
 
-Usage : tk_sm83_check.py ROM.gb dossier     dossier produit par tk_extract.py (variante A)
-                                            ou par tk_scan.py (catalogue complet, variantes A et B)
+Usage : tk_sm83_check.py ROM.gb dossier
+   dossier produit par tk_extract.py (variante A), par tk_scan.py (catalogue complet, variantes A et B)
+   ou par cv_scan.py (Castlevania Legends, variante C : verifie aussi la recompression de chaque flux)
 """
 import os, sys, glob, random
-from tk_lzss import compress, decompress
+from tk_compress import compress
 
 HALF_CARRY_IGNORED = True
 
@@ -22,6 +26,7 @@ class CPU:
         s.sp = s.pc = 0
         s.z = s.c = 0
         s.steps = 0
+        s.hooks = {}                       # pc -> fonction(cpu) : remplace une routine (ex. routine RAM non presente dans la ROM)
 
     # --- memoire
     def rd(s, a):
@@ -99,6 +104,10 @@ class CPU:
         else: s.set(z, v | (1 << y))
 
     def step(s):
+        h = s.hooks.get(s.pc)
+        if h:
+            s.steps += 1
+            return h(s)
         s.steps += 1
         op = s.fetch(); x, y, z = op >> 6, (op >> 3) & 7, op & 7; p, q = y >> 1, y & 1
         if op == 0xCB: return s.cb()
@@ -134,6 +143,14 @@ class CPU:
             if z == 4: v = (s.get(y) + 1) & 255; s.z = v == 0; return s.set(y, v)
             if z == 5: v = (s.get(y) - 1) & 255; s.z = v == 0; return s.set(y, v)
             if z == 6: return s.set(y, s.fetch())
+            if op in (0x07, 0x0F, 0x17, 0x1F):                 # RLCA RRCA RLA RRA (Z = 0)
+                a = s.r[7]
+                if op == 0x07: s.c = a >> 7; a = ((a << 1) | s.c) & 255
+                elif op == 0x0F: s.c = a & 1; a = (a >> 1) | (s.c << 7)
+                elif op == 0x17: nc = a >> 7; a = ((a << 1) | s.c) & 255; s.c = nc
+                else: nc = a & 1; a = (a >> 1) | (s.c << 7); s.c = nc
+                s.z = 0; s.r[7] = a
+                return
             if op == 0x37: s.c = 1; return
             raise NotImplementedError("op %02X" % op)
         # x == 3
@@ -226,6 +243,64 @@ def run_game_decoder_B(rom, lz, outlen, dest):
     return bytes(mem[dest:dest + outlen]), srcptr - 0x4000, cpu.steps
 
 
+def _cv_fill_hook(cpu):
+    """Routine RAM $DEC9 de Castlevania Legends : remplit BC octets a partir de HL avec A, puis RET."""
+    n = cpu.r[0] << 8 | cpu.r[1]
+    h = cpu.hl()
+    for i in range(n):
+        cpu.m[(h + i) & 0xFFFF] = cpu.r[7]
+    cpu.pc = cpu.pop()
+
+
+def run_game_decoder_C(rom, stream, outlen, dest=0x8800):
+    """Variante C : decodeur $2ECD de Castlevania Legends, mode VRAM ($C723 = 1, comme le chargeur de listes).
+    `stream` est place en $4000 ; HL = source, DE = destination, BC = longueur de sortie.
+    Retourne (octets ecrits en dest, octets source consommes, nb d'instructions)."""
+    mem = bytearray(0x10000)
+    mem[0:0x4000] = rom[0:0x4000]
+    mem[0x4000:0x4000 + len(stream)] = stream
+    rnd = random.Random(len(stream) * 13 + outlen)
+    for a in range(0xC000, 0xE000):                       # WRAM remplie de bruit
+        mem[a] = rnd.randrange(256)
+    mem[0xC723] = 1
+    cpu = CPU(mem)
+    cpu.hooks[0xDEC9] = _cv_fill_hook
+    cpu.r[4], cpu.r[5] = 0x40, 0x00
+    cpu.r[2], cpu.r[3] = dest >> 8, dest & 0xFF
+    cpu.r[0], cpu.r[1] = outlen >> 8, outlen & 0xFF
+    cpu.sp = 0xDFF0
+    cpu.push(SENTINEL)
+    cpu.pc = 0x2ECD
+    while cpu.pc != SENTINEL:
+        cpu.step()
+        if cpu.steps > 30_000_000:
+            raise RuntimeError("trop d'instructions")
+    srcptr = mem[0xC424] | mem[0xC425] << 8               # pointeur source du decodeur C
+    return bytes(mem[dest:dest + outlen]), srcptr - 0x4000, cpu.steps
+
+
+def check_cv(rom, d):
+    """Castlevania Legends : verifie chaque flux du catalogue (dossier produit par cv_scan.py) avec le vrai
+    decodeur, puis recompresse les donnees (modes optimal et okumura) et verifie aussi ces flux."""
+    import csv
+    if rom[0x2E53:0x2E59] != bytes.fromhex("F040CB7F2804"):          # LDH A,(LCDC) ; BIT 7,A ; JR Z : entree $2E53
+        sys.exit("ROM non reconnue : le chargeur de listes de Castlevania Legends (USA/Europe) n'est pas en $2E53")
+    ok = bad = 0
+    for r in csv.DictReader(open(os.path.join(d, "streams_castlevania_legends.csv"))):
+        base = os.path.join(d, "data", "b%s_%s" % (r["banque"], r["adresse"]))
+        lz = open(base + ".lz", "rb").read()
+        data = open(base + ".bin", "rb").read()
+        tests = [("flux d'origine", lz), ("recompresse optimal", compress(data, "optimal", "C")),
+                 ("recompresse okumura", compress(data, "okumura", "C"))]
+        for label, stream in tests:
+            got, used, _ = run_game_decoder_C(rom, stream, len(data))
+            good = got == data and used == len(stream)
+            ok += good; bad += (not good)
+            if not good:
+                print("ECHEC %s:%s (%s) consomme %d/%d" % (r["banque"], r["adresse"], label, used, len(stream)))
+    print("decodeur de Castlevania Legends sur le catalogue (flux d'origine + recompresses) : %d corrects, %d en echec" % (ok, bad))
+
+
 def check_scan(rom, d):
     """Verifie tous les flux de streams.csv (dossier produit par tk_scan.py) avec les vrais decodeurs."""
     import csv
@@ -251,6 +326,8 @@ def main():
         sys.exit(__doc__)
     rom = open(sys.argv[1], "rb").read()
     d = sys.argv[2]
+    if os.path.exists(os.path.join(d, "streams_castlevania_legends.csv")):
+        return check_cv(rom, d)
     if os.path.exists(os.path.join(d, "streams.csv")):
         return check_scan(rom, d)
     files = sorted(glob.glob(os.path.join(d, "lz", "b*.lz")))
